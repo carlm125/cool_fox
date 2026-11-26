@@ -333,6 +333,9 @@ struct Lower<'a> {
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
+    /// With `split_lds`, whether the host waves have synced since the last LDS write/atomic
+    /// in the current block, letting consecutive `ds_read*` instructions share one barrier.
+    lds_read_synced: bool,
     /// A console wave64 program run as two host waves of 32 that exchange through LDS: the first
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
@@ -1692,6 +1695,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             split_lds,
             lds_meet,
+            lds_read_synced: false,
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
             local_any: LOCAL_ANY.get(),
@@ -2412,8 +2416,12 @@ impl<'a> Lower<'a> {
                 };
                 self.vals.insert(phi.value, val);
             }
+            self.lds_read_synced = false;
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].0) {
                 self.lds_meeting();
+                if super::group_sync() != 0 {
+                    self.lds_read_synced = true;
+                }
             }
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
@@ -5327,11 +5335,17 @@ impl<'a> Lower<'a> {
             && !(name.starts_with("ds_swizzle") || name.contains("permute"))
             && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b])
         {
-            // the two host waves of a console wave meet before each LDS access: what the other
-            // half wrote is visible, and what it still reads is not overwritten
-            let mode = self.s.m.i32(meeting_mode());
-            let void = self.s.t.void;
-            self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            // the two host waves of a console wave meet before LDS writes/atomics and before the
+            // first `ds_read*` after a block entry or write; consecutive `ds_read*`s share one sync.
+            if name.starts_with("ds_read") {
+                if !self.lds_read_synced {
+                    self.lds_meeting();
+                    self.lds_read_synced = true;
+                }
+            } else {
+                self.lds_meeting();
+                self.lds_read_synced = false;
+            }
         }
         // The structure builder's threads take turns through atomics (a tree
         // built from its leaves up): what one wrote before its atomic is
@@ -5366,6 +5380,7 @@ impl<'a> Lower<'a> {
                 let void = self.s.t.void;
                 self.s
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                self.lds_read_synced = waits;
                 Ok(())
             }
             Fields::Sopp { .. } => Ok(()),
