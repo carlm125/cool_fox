@@ -1,0 +1,431 @@
+//! Foreground PC controls for a title window. Raw mouse motion drives the
+//! virtual right stick. F6 gives the desktop cursor back or captures it again.
+use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::{LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, VK_F5, VK_F6, VK_LBUTTON, VK_RBUTTON,
+};
+use windows_sys::Win32::UI::Input::{
+    GetRawInputData, MOUSE_MOVE_ABSOLUTE, MOUSE_VIRTUAL_DESKTOP, RAWINPUT, RAWINPUTDEVICE,
+    RAWINPUTHEADER, RID_INPUT, RIM_TYPEMOUSE, RegisterRawInputDevices,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging as wm;
+use windows_sys::core::w;
+
+use super::{KeyState, LEFT_SHOULDER, PadState, RIGHT_SHOULDER, lock, merged, pc_keyboard};
+
+pub(super) fn enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_PC_CONTROLS").is_some_and(|s| s == "1"))
+}
+
+// A small averaging window bridges the mouse report rate and the game's
+// frame rate. A stopped mouse returns completely to neutral.
+#[derive(Default)]
+struct Motion {
+    pending: [f32; 2],
+    velocity: [f32; 2],
+    sampled: Option<Instant>,
+    moved: Option<Instant>,
+}
+
+impl Motion {
+    fn add(&mut self, dx: f32, dy: f32, now: Instant) {
+        if dx != 0.0 || dy != 0.0 {
+            self.pending[0] += dx;
+            self.pending[1] -= dy;
+            self.moved = Some(now);
+        }
+    }
+
+    fn stick(&mut self, now: Instant) -> [f32; 2] {
+        let dt = self
+            .sampled
+            .replace(now)
+            .map_or(0.008, |t| now.duration_since(t).as_secs_f32())
+            .clamp(0.001, 0.060);
+        let deltas = std::mem::take(&mut self.pending);
+        if self
+            .moved
+            .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(60))
+        {
+            self.velocity = [0.0; 2];
+            return self.velocity;
+        }
+        let blend = 1.0 - (-dt / 0.022).exp();
+        for (v, delta) in self.velocity.iter_mut().zip(deltas) {
+            *v += blend * (delta / (dt * 1300.0) - *v);
+        }
+        let [x, y] = self.velocity;
+        let len = x.hypot(y);
+        if len < 0.012 {
+            return [0.0; 2];
+        }
+        // Give small movements enough range to cross a game's stick dead zone.
+        let gain = (0.19 + 0.81 * len.min(1.0)) / len;
+        [x * gain, y * gain]
+    }
+}
+
+#[derive(Default)]
+struct Capture {
+    window: usize,
+    clip: Option<RECT>,
+    motion: Motion,
+    absolute: Option<(usize, i32, i32)>,
+    blocked: u8,
+    last_flags: usize,
+}
+
+static CAPTURE: LazyLock<Mutex<Capture>> = LazyLock::new(|| Mutex::new(Capture::default()));
+static DRIVING: AtomicBool = AtomicBool::new(false);
+static WANTED: AtomicBool = AtomicBool::new(true);
+static RAW: OnceLock<bool> = OnceLock::new();
+
+pub(in crate::modules) fn install(hwnd: HWND) {
+    if !enabled() {
+        return;
+    }
+    // SAFETY: window creation calls us with a live title window. A child
+    // cannot own pointer capture or advertise the desktop controller profile.
+    unsafe {
+        if wm::GetAncestor(hwnd, wm::GA_ROOT) != hwnd {
+            return;
+        }
+        wm::SetPropW(hwnd, w!("victory.pc_controls"), 1usize as _);
+    }
+    RAW.get_or_init(|| {
+        // Foreground delivery to the window with focus. Keep ordinary
+        // window and keyboard messages available to the title and OS.
+        let mouse = RAWINPUTDEVICE {
+            usUsagePage: 1,
+            usUsage: 2,
+            dwFlags: 0,
+            hwndTarget: null_mut(),
+        };
+        // SAFETY: one device descriptor of the advertised size.
+        let ok =
+            unsafe { RegisterRawInputDevices(&mouse, 1, size_of::<RAWINPUTDEVICE>() as u32) } != 0;
+        if !ok {
+            tracing::warn!("could not register foreground raw mouse input");
+        }
+        ok
+    });
+    acquire(hwnd);
+}
+
+fn mouse_buttons() -> u8 {
+    // SAFETY: queries of physical mouse button state.
+    unsafe {
+        u8::from(GetAsyncKeyState(VK_LBUTTON.into()) < 0)
+            | (u8::from(GetAsyncKeyState(VK_RBUTTON.into()) < 0) << 1)
+    }
+}
+
+fn clip_to_client(hwnd: HWND) -> Option<RECT> {
+    let mut rect = RECT::default();
+    let mut start = POINT::default();
+    // SAFETY: a live title window; the rectangles and points are writable.
+    unsafe {
+        if wm::GetClientRect(hwnd, &mut rect) == 0 || rect.right <= 1 || rect.bottom <= 1 {
+            return None;
+        }
+        let mut end = POINT {
+            x: rect.right,
+            y: rect.bottom,
+        };
+        if ClientToScreen(hwnd, &mut start) == 0 || ClientToScreen(hwnd, &mut end) == 0 {
+            return None;
+        }
+        let bounds = RECT {
+            left: start.x,
+            top: start.y,
+            right: end.x,
+            bottom: end.y,
+        };
+        (wm::ClipCursor(&bounds) != 0).then_some(bounds)
+    }
+}
+
+fn acquire(hwnd: HWND) {
+    if !WANTED.load(Relaxed) || RAW.get() != Some(&true) {
+        return;
+    }
+    // SAFETY: queries of the foreground and the supplied window.
+    if unsafe {
+        wm::GetForegroundWindow() != hwnd
+            || wm::GetAncestor(hwnd, wm::GA_ROOT) != hwnd
+            || wm::IsIconic(hwnd) != 0
+    } {
+        return;
+    }
+    let mut state = lock(&CAPTURE);
+    if state.window == hwnd as usize {
+        return;
+    }
+    let Some(clip) = clip_to_client(hwnd) else {
+        return;
+    };
+    *state = Capture {
+        window: hwnd as usize,
+        clip: Some(clip),
+        blocked: mouse_buttons(),
+        ..Capture::default()
+    };
+    // SAFETY: an integer flag on our own window and a temporary invisible cursor.
+    unsafe {
+        wm::SetPropW(hwnd, w!("victory.mouse_look"), 1usize as _);
+        if DRIVING.load(Relaxed) {
+            wm::SetPropW(hwnd, w!("victory.driving_keys"), 1usize as _);
+        }
+        wm::SetCursor(null_mut());
+    }
+}
+
+fn release(hwnd: HWND) {
+    let mut state = lock(&CAPTURE);
+    if state.window != hwnd as usize || hwnd.is_null() {
+        return;
+    }
+    // A newly focused program may already have claimed the desktop clip.
+    // SAFETY: the rectangle is writable and we clear only our own clip/properties.
+    unsafe {
+        let mut current = RECT::default();
+        if let Some(ours) = state.clip
+            && wm::GetClipCursor(&mut current) != 0
+            && (current.left, current.top, current.right, current.bottom)
+                == (ours.left, ours.top, ours.right, ours.bottom)
+        {
+            wm::ClipCursor(null());
+        }
+        wm::RemovePropW(hwnd, w!("victory.mouse_look"));
+        wm::RemovePropW(hwnd, w!("victory.pc_buttons"));
+        if wm::GetForegroundWindow() == hwnd {
+            wm::SetCursor(wm::LoadCursorW(null_mut(), wm::IDC_ARROW));
+        }
+    }
+    *state = Capture::default();
+}
+
+fn raw_motion(hwnd: HWND, handle: LPARAM) -> bool {
+    let mut state = lock(&CAPTURE);
+    if state.window != hwnd as usize {
+        return false;
+    }
+    let mut packet = RAWINPUT::default();
+    let mut size = size_of::<RAWINPUT>() as u32;
+    // SAFETY: WM_INPUT supplied the handle, and packet is a fixed-size, aligned mouse buffer.
+    let read = unsafe {
+        GetRawInputData(
+            handle as _,
+            RID_INPUT,
+            (&raw mut packet).cast(),
+            &mut size,
+            size_of::<RAWINPUTHEADER>() as u32,
+        )
+    };
+    if read == u32::MAX
+        || read
+            < (size_of::<RAWINPUTHEADER>() + size_of::<windows_sys::Win32::UI::Input::RAWMOUSE>())
+                as u32
+        || packet.header.dwType != RIM_TYPEMOUSE
+    {
+        return false;
+    }
+    // SAFETY: the header selects the mouse member.
+    let mouse = unsafe { packet.data.mouse };
+    let (x, y) = (mouse.lLastX, mouse.lLastY);
+    let (dx, dy) = if mouse.usFlags & MOUSE_MOVE_ABSOLUTE == 0 {
+        state.absolute = None;
+        (x as f32, y as f32)
+    } else {
+        // Tablets and remote desktops may report normalized absolute coordinates.
+        let device = packet.header.hDevice as usize;
+        let last = state.absolute.replace((device, x, y));
+        let Some((previous, px, py)) = last else {
+            return true;
+        };
+        if previous != device {
+            return true;
+        }
+        let (w, h) = if mouse.usFlags & MOUSE_VIRTUAL_DESKTOP != 0 {
+            (wm::SM_CXVIRTUALSCREEN, wm::SM_CYVIRTUALSCREEN)
+        } else {
+            (wm::SM_CXSCREEN, wm::SM_CYSCREEN)
+        };
+        // SAFETY: read-only desktop metrics.
+        unsafe {
+            (
+                (x - px) as f32 * wm::GetSystemMetrics(w) as f32 / 65535.0,
+                (y - py) as f32 * wm::GetSystemMetrics(h) as f32 / 65535.0,
+            )
+        }
+    };
+    state.motion.add(dx, dy, Instant::now());
+    true
+}
+
+pub(in crate::modules) fn window_message(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+) -> Option<LRESULT> {
+    if !enabled() {
+        return None;
+    }
+    match msg {
+        wm::WM_INPUT if raw_motion(hwnd, lp) => {
+            // SAFETY: raw input handled above; Windows requires foreground input cleanup.
+            return Some(unsafe { wm::DefWindowProcW(hwnd, msg, wp, lp) });
+        }
+        wm::WM_SETFOCUS => acquire(hwnd),
+        wm::WM_ACTIVATE if (wp as u16) != wm::WA_INACTIVE as u16 => acquire(hwnd),
+        wm::WM_ACTIVATEAPP if wp == 0 => release(hwnd),
+        wm::WM_KILLFOCUS | wm::WM_ENTERSIZEMOVE => release(hwnd),
+        wm::WM_NCDESTROY => {
+            release(hwnd);
+            // SAFETY: remove the properties while the title window still exists.
+            unsafe {
+                wm::RemovePropW(hwnd, w!("victory.pc_controls"));
+                wm::RemovePropW(hwnd, w!("victory.driving_keys"));
+            }
+        }
+        wm::WM_EXITSIZEMOVE => acquire(hwnd),
+        wm::WM_SIZE if wp == wm::SIZE_MINIMIZED as usize => release(hwnd),
+        wm::WM_MOVE | wm::WM_SIZE => {
+            let mut state = lock(&CAPTURE);
+            if state.window == hwnd as usize {
+                state.clip = clip_to_client(hwnd).or(state.clip);
+            }
+        }
+        wm::WM_KEYDOWN if wp == usize::from(VK_F5) => {
+            if lp & (1 << 30) == 0 {
+                let was_driving = DRIVING.fetch_xor(true, Relaxed);
+                // SAFETY: the panel displays the selected layer on this window.
+                unsafe {
+                    if was_driving {
+                        wm::RemovePropW(hwnd, w!("victory.driving_keys"));
+                    } else {
+                        wm::SetPropW(hwnd, w!("victory.driving_keys"), 1usize as _);
+                    }
+                }
+            }
+            return Some(0);
+        }
+        wm::WM_KEYDOWN if wp == usize::from(VK_F6) => {
+            if lp & (1 << 30) == 0 {
+                if WANTED.fetch_xor(true, Relaxed) {
+                    release(hwnd);
+                } else {
+                    acquire(hwnd);
+                }
+            }
+            return Some(0);
+        }
+        wm::WM_SETCURSOR
+            if (lp as u16) == wm::HTCLIENT as u16 && lock(&CAPTURE).window == hwnd as usize =>
+        {
+            // SAFETY: setting the cursor for our focused client area.
+            unsafe {
+                wm::SetCursor(null_mut());
+            }
+            return Some(1);
+        }
+        _ => (),
+    }
+    None
+}
+
+fn mouse_pad(pressed: u8, right_x: f32, right_y: f32, driving: bool) -> PadState {
+    let mut pad = PadState {
+        right_x,
+        right_y,
+        ..PadState::default()
+    };
+    if driving {
+        if pressed & 1 != 0 {
+            pad.buttons |= RIGHT_SHOULDER;
+        } // vehicle fire
+        if pressed & 2 != 0 {
+            pad.buttons |= LEFT_SHOULDER;
+        } // weapon / aim
+    } else {
+        pad.left_trigger = f32::from(pressed >> 1);
+        pad.right_trigger = f32::from(pressed & 1);
+    }
+    pad
+}
+
+pub(super) fn read(keys: &[KeyState]) -> PadState {
+    let driving = DRIVING.load(Relaxed);
+    let keyboard = pc_keyboard(keys, driving);
+    let mut state = lock(&CAPTURE);
+    let window = state.window as HWND;
+    // SAFETY: only the focused title receives physical mouse inputs.
+    if window.is_null() || unsafe { wm::GetForegroundWindow() } != window {
+        return keyboard;
+    }
+    let held = mouse_buttons();
+    state.blocked &= held;
+    let pressed = held & !state.blocked;
+    let [right_x, right_y] = state.motion.stick(Instant::now());
+    let pad = merged(keyboard, mouse_pad(pressed, right_x, right_y, driving));
+    // The click-through control legend reads the virtual pad state, including
+    // contextual A/B/X/Y prompts, without polling the desktop's physical keys.
+    let flags = pad.buttons as usize
+        | (usize::from(pad.left_trigger > 0.0) << 16)
+        | (usize::from(pad.right_trigger > 0.0) << 17)
+        | (usize::from(pad.left_x != 0.0 || pad.left_y != 0.0) << 18)
+        | (usize::from(pad.right_x != 0.0 || pad.right_y != 0.0) << 19);
+    if flags != state.last_flags {
+        // SAFETY: a small integer value stored on the current title window.
+        unsafe {
+            wm::SetPropW(window, w!("victory.pc_buttons"), (flags + 1) as _);
+        }
+        state.last_flags = flags;
+    }
+    pad
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn both_mouse_buttons_work_together_in_both_layouts() {
+        let foot = mouse_pad(3, 0.4, -0.2, false);
+        assert_eq!(
+            (
+                foot.left_trigger,
+                foot.right_trigger,
+                foot.right_x,
+                foot.right_y
+            ),
+            (1.0, 1.0, 0.4, -0.2)
+        );
+        let car = mouse_pad(3, 0.0, 0.0, true);
+        assert_eq!(
+            (car.buttons, car.left_trigger, car.right_trigger),
+            (LEFT_SHOULDER | RIGHT_SHOULDER, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn raw_motion_turns_right_and_up_then_stops() {
+        let t = Instant::now();
+        let mut m = Motion::default();
+        m.add(2.0, -3.0, t);
+        let [x, y] = m.stick(t);
+        assert!(x > 0.0 && y > x && x.hypot(y) <= 1.00001);
+        assert_eq!(m.stick(t + Duration::from_millis(65)), [0.0; 2]);
+        m.add(-900.0, 900.0, t + Duration::from_millis(73));
+        let [x, y] = m.stick(t + Duration::from_millis(73));
+        assert!(x < 0.0 && y < 0.0 && (x.hypot(y) - 1.0).abs() < 0.00001);
+    }
+}

@@ -262,6 +262,9 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
+On Windows, an optional desktop profile maps the mouse and keyboard to this same
+controller. See the [PC controls and Xbox prompts](pc-controls.md).
+
 ## Commands
 
 ```

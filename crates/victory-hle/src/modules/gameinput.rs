@@ -17,6 +17,9 @@ use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+pub(super) mod mouse;
+
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
@@ -111,6 +114,10 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    /// The keyboard and mouse contribution to the virtual controller.
+    fn desktop_pad(&mut self, keys: &[KeyState]) -> PadState {
+        fallback(keys)
+    }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
@@ -134,6 +141,52 @@ fn fallback(keys: &[KeyState]) -> PadState {
         left_y: on(b'W') - on(b'S'),
         right_x: on(b'L') - on(b'J'),
         right_y: on(b'I') - on(b'K'),
+    }
+}
+
+/// Desktop bindings for the title's Default gamepad scheme. The driving
+/// layer is explicit: holding W on foot must never pull the fire trigger.
+#[cfg(any(windows, test))]
+fn pc_keyboard(keys: &[KeyState], driving: bool) -> PadState {
+    let down = |vk| keys.iter().any(|key| key.virtual_key == vk);
+    let axis = |positive, negative| {
+        f32::from(u8::from(down(positive))) - f32::from(u8::from(down(negative)))
+    };
+    let buttons = keys.iter().fold(0, |bits, key| {
+        bits | match key.virtual_key {
+            0x1b => MENU,     // Esc
+            b'M' => VIEW,     // map
+            0x0d | 0x20 => A, // Enter, Space (jump or handbrake)
+            0x08 | b'B' => B, // Backspace, B
+            b'X' | b'R' => X,
+            b'F' | b'Y' => Y,              // contextual interaction or vehicle door
+            b'E' if driving => LEFT_STICK, // horn
+            b'E' => Y,
+            0x09 => LEFT_SHOULDER,     // Tab, equipment wheel
+            b'Q' => RIGHT_SHOULDER,    // cover
+            0xa0 | 0xa1 => LEFT_STICK, // Shift, sprint or vehicle boost
+            0xa2 | 0xa3 => B,          // Ctrl, crouch
+            b'H' if driving => B,      // headlights
+            b'C' | b'H' => RIGHT_STICK,
+            0x26 => UP,
+            0x28 => DOWN,
+            0x25 => LEFT,
+            0x27 => RIGHT,
+            _ => 0,
+        }
+    });
+    PadState {
+        buttons,
+        left_trigger: f32::from(u8::from(down(b'Z') || driving && down(b'S'))),
+        right_trigger: f32::from(u8::from(driving && down(b'W'))),
+        // Numpad 8/4/2/6 is always the full left stick. At the wheel W/S
+        // are pedals, but a contextual prompt can still request a stick tilt.
+        left_x: f32::from(u8::from(down(b'D') || down(0x66)))
+            - f32::from(u8::from(down(b'A') || down(0x64))),
+        left_y: f32::from(u8::from(down(0x68) || !driving && down(b'W')))
+            - f32::from(u8::from(down(0x62) || !driving && down(b'S'))),
+        right_x: axis(b'L', b'J'),
+        right_y: axis(b'I', b'K'),
     }
 }
 
@@ -430,12 +483,14 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, desktop) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            let keys = source.keys();
+            let desktop = source.desktop_pad(&keys);
+            (pads, keys, desktop)
         };
-        let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
+        let events = self.state().poll(&self.devices, self.one_pad, pads, keys, desktop);
         self.deliver(events);
     }
 
@@ -481,11 +536,12 @@ impl State {
         one_pad: bool,
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        desktop: PadState,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            let pad = pads.into_iter().flatten().fold(desktop, merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
@@ -494,7 +550,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then_some(Value::Pad(desktop));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1231,6 +1287,14 @@ mod host {
                 .collect()
         }
 
+        fn desktop_pad(&mut self, keys: &[KeyState]) -> PadState {
+            if mouse::enabled() {
+                mouse::read(keys)
+            } else {
+                fallback(keys)
+            }
+        }
+
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             let speeds = XINPUT_VIBRATION {
                 wLeftMotorSpeed: low,
@@ -1534,6 +1598,56 @@ mod tests {
         let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(rest), PadState::default());
         release(rest);
+    }
+
+    #[test]
+    fn pc_layout_matches_the_default_controller_and_keeps_the_legacy_layout() {
+        let walk = |ks: &[u8]| pc_keyboard(&ks.iter().copied().map(key).collect::<Vec<_>>(), false);
+        assert_eq!(walk(&[0x20, 0x0d]).buttons, A);
+        assert_eq!(walk(&[0xa0, 0xa1]).buttons, LEFT_STICK);
+        assert_eq!(walk(&[0x09, b'Q', b'E', b'F']).buttons, LEFT_SHOULDER | RIGHT_SHOULDER | Y);
+        assert_eq!(walk(&[0xa2, 0x08, b'M']).buttons, B | VIEW);
+        let sprinting = walk(&[b'W', 0xa0, 0x20]);
+        assert_eq!((sprinting.left_y, sprinting.right_trigger, sprinting.buttons), (1.0, 0.0, LEFT_STICK | A));
+        assert_eq!(fallback(&[key(b'F')]).buttons, LEFT_STICK);
+    }
+
+    #[test]
+    fn every_pad_glyph_has_a_keyboard_or_mouse_binding() {
+        for driving in [false, true] {
+            for (vk, button) in [
+                (0x0d, A), (0x08, B), (b'R', X), (b'F', Y),
+                (0x09, LEFT_SHOULDER), (b'Q', RIGHT_SHOULDER),
+                (0xa0, LEFT_STICK), (b'C', RIGHT_STICK),
+                (0x26, UP), (0x28, DOWN), (0x25, LEFT), (0x27, RIGHT),
+                (b'M', VIEW), (0x1b, MENU),
+            ] {
+                assert_eq!(pc_keyboard(&[key(vk)], driving).buttons, button);
+            }
+            let pair = pc_keyboard(&[key(0x09), key(b'Q'), key(0xa1), key(b'C')], driving);
+            assert_eq!(pair.buttons, LEFT_SHOULDER | RIGHT_SHOULDER | LEFT_STICK | RIGHT_STICK);
+            assert_eq!(pc_keyboard(&[key(0x68), key(0x62), key(0x64), key(0x66)], driving).left_x, 0.0);
+            for (vk, x, y) in [(0x68, 0.0, 1.0), (0x62, 0.0, -1.0), (0x64, -1.0, 0.0), (0x66, 1.0, 0.0)] {
+                let p = pc_keyboard(&[key(vk)], driving);
+                assert_eq!((p.left_x, p.left_y, p.left_trigger, p.right_trigger), (x, y, 0.0, 0.0));
+            }
+            for (vk, x, y) in [(b'I', 0.0, 1.0), (b'K', 0.0, -1.0), (b'J', -1.0, 0.0), (b'L', 1.0, 0.0)] {
+                let p = pc_keyboard(&[key(vk)], driving);
+                assert_eq!((p.right_x, p.right_y), (x, y));
+            }
+        }
+    }
+
+    #[test]
+    fn driving_uses_separate_pedals_and_preserves_steering_and_menu_navigation() {
+        let pad = pc_keyboard(&[key(b'W'), key(b'D'), key(0x20), key(b'E')], true);
+        assert_eq!((pad.right_trigger, pad.left_trigger, pad.left_x, pad.left_y), (1.0, 0.0, 1.0, 0.0));
+        assert_eq!(pad.buttons, A | LEFT_STICK);
+        let brake = pc_keyboard(&[key(b'S'), key(b'H'), key(0x26)], true);
+        assert_eq!((brake.left_trigger, brake.right_trigger, brake.buttons), (1.0, 0.0, B | UP));
+        let sticks = pc_keyboard(&[key(0x68), key(0x64), key(b'I'), key(b'L'), key(0xa0), key(b'C')], true);
+        assert_eq!((sticks.left_x, sticks.left_y, sticks.right_x, sticks.right_y), (-1.0, 1.0, 1.0, 1.0));
+        assert_eq!((sticks.left_trigger, sticks.right_trigger, sticks.buttons), (0.0, 0.0, LEFT_STICK | RIGHT_STICK));
     }
 
     #[test]
